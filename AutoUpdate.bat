@@ -4,9 +4,11 @@ setlocal enabledelayedexpansion
 :: ==================================================
 :: SandBox Multi Repo Updater
 :: - Find git.exe automatically
-:: - Update root repo
-:: - Update repos inside Assets
-:: - Show new commits / changed files / summary
+:: - Per repository:
+::   1. Fetch update remote
+::   2. Merge/update local branch
+::   3. Show changed contents if updated
+::   4. Push to origin only when needed
 :: ==================================================
 
 call :FindGit
@@ -58,7 +60,7 @@ echo.
 echo ==================================================
 if defined HAS_ERROR (
     echo PROCESS DONE WITH ERRORS.
-    echo Some repositories failed to update.
+    echo Some repositories failed to update or push.
 ) else (
     echo ALL PROCESS DONE.
 )
@@ -70,11 +72,15 @@ exit /b 0
 
 :: ==================================================
 :: Function: UpdateRepo
+:: One repo flow:
+:: Fetch -> Merge -> Print changes -> Push if needed -> Next repo
 :: ==================================================
 :UpdateRepo
 set "REPO=%~1"
 
+echo --------------------------------------------------
 echo [Target]: %REPO%
+echo --------------------------------------------------
 
 pushd "%REPO%" >nul 2>nul
 if errorlevel 1 (
@@ -89,7 +95,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Save current HEAD
+:: Save current HEAD before update
 set "OLD_HEAD="
 for /f "delims=" %%H in ('"%GIT%" rev-parse HEAD 2^>nul') do (
     set "OLD_HEAD=%%H"
@@ -120,17 +126,16 @@ if not defined REMOTE (
     exit /b 1
 )
 
-echo Remote: !REMOTE!
+:: Detect main or master from selected remote
+set "BRANCH="
 
+echo [1/4] Fetch update remote: !REMOTE!
 "%GIT%" fetch !REMOTE!
 if errorlevel 1 (
-    echo [FAIL] %REPO%: Fetch failed.
+    echo [FAIL] %REPO%: Fetch !REMOTE! failed.
     popd
     exit /b 1
 )
-
-:: Detect main or master
-set "BRANCH="
 
 "%GIT%" show-ref --verify --quiet "refs/remotes/!REMOTE!/main"
 if not errorlevel 1 (
@@ -148,36 +153,58 @@ if not defined BRANCH (
     exit /b 1
 )
 
-echo Merge: !REMOTE!/!BRANCH!
+echo Target: !REMOTE!/!BRANCH!
 
-:: Safety check: warn if current branch is not main/master
+:: Check current branch
 set "CURRENT_BRANCH="
 for /f "delims=" %%B in ('"%GIT%" rev-parse --abbrev-ref HEAD 2^>nul') do (
     set "CURRENT_BRANCH=%%B"
 )
 
 if /i not "!CURRENT_BRANCH!"=="!BRANCH!" (
-    echo [WARN] %REPO%: Current branch is "!CURRENT_BRANCH!", remote target is "!BRANCH!".
-    echo [WARN] Merge will be attempted with --ff-only only.
+    echo [FAIL] %REPO%: Current branch is "!CURRENT_BRANCH!", target is "!BRANCH!".
+    echo For safety, update and push are skipped.
+    popd
+    exit /b 1
 )
 
-:: Fast-forward only
-"%GIT%" merge --ff-only !REMOTE!/!BRANCH!
-if errorlevel 1 (
-    echo [FAIL] %REPO%: Merge failed.
-    echo Reason may be local changes, conflicts, or divergent commits.
+:: Check local uncommitted changes
+set "HAS_LOCAL_CHANGE="
+for /f "delims=" %%S in ('"%GIT%" status --porcelain 2^>nul') do (
+    set "HAS_LOCAL_CHANGE=1"
+)
+
+if defined HAS_LOCAL_CHANGE (
+    echo [FAIL] %REPO%: Local uncommitted changes detected.
+    echo Please commit, stash, or discard changes first.
     echo Check this repo manually:
-    echo   cd %CD%
     echo   git status
     popd
     exit /b 1
 )
 
-:: Save new HEAD
+echo.
+echo [2/4] Update local branch
+echo Merge: !REMOTE!/!BRANCH!
+
+"%GIT%" merge --ff-only !REMOTE!/!BRANCH!
+if errorlevel 1 (
+    echo [FAIL] %REPO%: Merge failed.
+    echo Reason may be local commits, conflicts, or divergent history.
+    echo Check this repo manually:
+    echo   git status
+    popd
+    exit /b 1
+)
+
+:: Save new HEAD after update
 set "NEW_HEAD="
 for /f "delims=" %%H in ('"%GIT%" rev-parse HEAD 2^>nul') do (
     set "NEW_HEAD=%%H"
 )
+
+echo.
+echo [3/4] Update result
 
 if /i "!OLD_HEAD!"=="!NEW_HEAD!" (
     echo [OK] %REPO%: Already up to date.
@@ -185,15 +212,79 @@ if /i "!OLD_HEAD!"=="!NEW_HEAD!" (
     echo [OK] %REPO%: Updated from !REMOTE!/!BRANCH!
     echo.
     echo ---- New Commits ----
-    "%GIT%" log --oneline --decorate !OLD_HEAD!..!NEW_HEAD!
+    "%GIT%" --no-pager log --oneline --decorate !OLD_HEAD!..!NEW_HEAD!
 
     echo.
     echo ---- Changed Files ----
-    "%GIT%" diff --name-status !OLD_HEAD! !NEW_HEAD!
+    "%GIT%" --no-pager diff --name-status !OLD_HEAD! !NEW_HEAD!
 
     echo.
     echo ---- Summary ----
-    "%GIT%" diff --stat !OLD_HEAD! !NEW_HEAD!
+    "%GIT%" --no-pager diff --stat !OLD_HEAD! !NEW_HEAD!
+)
+
+echo.
+echo [4/4] Push check
+
+:: If origin does not exist, skip push
+"%GIT%" remote get-url origin >nul 2>nul
+if errorlevel 1 (
+    echo [WARN] %REPO%: origin remote not found. Push skipped.
+    popd
+    exit /b 0
+)
+
+:: Make sure origin info is fresh for push-count check
+if /i not "!REMOTE!"=="origin" (
+    echo Fetch origin for push check...
+    "%GIT%" fetch origin >nul 2>nul
+    if errorlevel 1 (
+        echo [FAIL] %REPO%: Fetch origin failed. Cannot check push state.
+        popd
+        exit /b 1
+    )
+)
+
+:: Check if origin branch exists
+"%GIT%" show-ref --verify --quiet "refs/remotes/origin/!BRANCH!"
+if errorlevel 1 (
+    echo [INFO] %REPO%: origin/!BRANCH! not found.
+    echo Push: create origin/!BRANCH!
+    "%GIT%" push origin HEAD:!BRANCH!
+    if errorlevel 1 (
+        echo [FAIL] %REPO%: Push to origin failed.
+        popd
+        exit /b 1
+    ) else (
+        echo [OK] %REPO%: Pushed to origin/!BRANCH!
+        popd
+        exit /b 0
+    )
+)
+
+:: Count commits that local HEAD has but origin/branch does not have
+set "PUSH_COUNT=0"
+for /f "delims=" %%C in ('"%GIT%" rev-list --count origin/!BRANCH!..HEAD 2^>nul') do (
+    set "PUSH_COUNT=%%C"
+)
+
+if "!PUSH_COUNT!"=="0" (
+    echo [OK] %REPO%: No push needed.
+    popd
+    exit /b 0
+)
+
+echo Push needed: !PUSH_COUNT! commit(s)
+echo Push: origin !BRANCH!
+
+"%GIT%" push origin HEAD:!BRANCH!
+if errorlevel 1 (
+    echo [FAIL] %REPO%: Push to origin failed.
+    echo Reason may be login, permission, protected branch, or network issue.
+    popd
+    exit /b 1
+) else (
+    echo [OK] %REPO%: Pushed to origin/!BRANCH!
 )
 
 popd
