@@ -11,7 +11,6 @@ TagManager:
   - 
   - Water
   - UI
-  - Interact
   - 
   - 
   - 
@@ -34,8 +33,9 @@ TagManager:
   - 
   - 
   - 
-  - 
-  - 
+  - BuildingFloor
+  - Intraactable
+  - Wall
   - Ground
   m_SortingLayers:
   - name: Default
