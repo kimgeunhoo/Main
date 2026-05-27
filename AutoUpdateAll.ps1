@@ -496,7 +496,9 @@ function Get-AutoStashes {
     $list = Invoke-Git -Repo $Repo -Args @("stash", "list", "--format=%gd|%H|%s") -Quiet
     if ($list.Code -ne 0) { return @() }
 
-    $items = New-Object System.Collections.Generic.List[object]
+    # PowerShell 5.x에서 Generic List를 그대로 return하면 환경에 따라
+    # "인수 형식이 일치하지 않습니다"가 날 수 있어서 순수 PS 배열로 처리한다.
+    $items = @()
 
     foreach ($line in $list.Output) {
         if ($null -eq $line) { continue }
@@ -514,14 +516,14 @@ function Get-AutoStashes {
             continue
         }
 
-        $items.Add([PSCustomObject]@{
+        $items += [PSCustomObject]@{
             Ref = $ref
             Hash = $hash
             Subject = $subject
-        })
+        }
     }
 
-    return @($items)
+    return $items
 }
 
 function Find-StashRef {
