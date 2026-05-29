@@ -1,17 +1,65 @@
-param(
+﻿param(
     [string]$RootPath = $PSScriptRoot,
     [int]$MaxDepth = 8,
-    [switch]$NoAutoTrustSafeDirectory
+    [switch]$NoAutoTrustSafeDirectory,
+
+    # "auto"이면 fork 구조 기준으로 upstream을 우선 사용합니다.
+    # upstream이 없거나 현재 브랜치에 맞지 않으면 tracking/origin으로 fallback합니다.
+    [string]$UpdateRemote = "auto",
+
+    # 기본값: origin에 push할 커밋이 있으면 자동 push합니다.
+    # 확인을 받고 싶으면 -AskBeforePushOrigin 옵션을 붙이세요.
+    [switch]$AskBeforePushOrigin,
+
+    # 기본값: 로컬 변경사항은 자동 stash 후 업데이트합니다.
+    # 확인을 받고 싶으면 -AskBeforeStash 옵션을 붙이세요.
+    [switch]$AskBeforeStash,
+
+    # 기본값: ff-only merge 실패 시 자동 rebase를 시도합니다.
+    # 확인을 받고 싶으면 -AskBeforeRebase 옵션을 붙이세요.
+    [switch]$AskBeforeRebase,
+
+    # 충돌 발생 시 기본값은 멈춰서 사용자의 선택을 받습니다.
+    # 자동 작업을 계속 돌리고 싶으면 -ContinueOnConflict 옵션을 붙이세요.
+    [switch]$ContinueOnConflict,
+
+    # 기본값: upstream 동기화 전/후로 origin/current branch도 자동 동기화합니다.
+    # 원하지 않으면 -SkipOriginPull 옵션을 붙이세요.
+    [switch]$SkipOriginPull,
+
+    # 자동 stash 복구만 수행합니다.
+    # 기존 업데이트로 auto-update_keep_* stash가 남아있을 때 이 옵션으로 복구하세요.
+    [switch]$RestoreLatestAutoStashOnly,
+
+    # stash restore 성공 후에도 stash를 지우지 않습니다.
+    # 기본값은 apply 성공 후 drop입니다.
+    [switch]$KeepStashAfterRestore
 )
 
 $ErrorActionPreference = "Continue"
-$env:GIT_PAGER = ""
 
 function Write-Section($text) {
     Write-Host ""
     Write-Host "============================================================"
     Write-Host $text
     Write-Host "============================================================"
+}
+
+function New-Result {
+    param(
+        [int]$Code,
+        [object]$Output
+    )
+
+    $lines = @()
+    if ($null -ne $Output) {
+        $lines = @($Output)
+    }
+
+    return [PSCustomObject]@{
+        Code = $Code
+        Output = $lines
+    }
 }
 
 function Test-GitInstalled {
@@ -40,15 +88,15 @@ function Invoke-Git {
 
     $output = & git --no-pager -C $Repo @Args 2>&1
     $code = $LASTEXITCODE
+    $result = New-Result -Code $code -Output $output
 
-    if (-not $Quiet -and $output) {
-        $output | ForEach-Object { Write-Host $_ }
+    if (-not $Quiet -and $result.Output.Count -gt 0) {
+        $result.Output | ForEach-Object {
+            if ($null -ne $_) { Write-Host $_ }
+        }
     }
 
-    return [PSCustomObject]@{
-        Code = $code
-        Output = @($output)
-    }
+    return $result
 }
 
 function Invoke-GitGlobal {
@@ -59,15 +107,15 @@ function Invoke-GitGlobal {
 
     $output = & git --no-pager @Args 2>&1
     $code = $LASTEXITCODE
+    $result = New-Result -Code $code -Output $output
 
-    if (-not $Quiet -and $output) {
-        $output | ForEach-Object { Write-Host $_ }
+    if (-not $Quiet -and $result.Output.Count -gt 0) {
+        $result.Output | ForEach-Object {
+            if ($null -ne $_) { Write-Host $_ }
+        }
     }
 
-    return [PSCustomObject]@{
-        Code = $code
-        Output = @($output)
-    }
+    return $result
 }
 
 function Invoke-Gh {
@@ -80,8 +128,15 @@ function Invoke-Gh {
     try {
         $output = & gh @Args 2>&1
         $code = $LASTEXITCODE
-        if ($output) { $output | ForEach-Object { Write-Host $_ } }
-        return [PSCustomObject]@{ Code = $code; Output = @($output) }
+        $result = New-Result -Code $code -Output $output
+
+        if ($result.Output.Count -gt 0) {
+            $result.Output | ForEach-Object {
+                if ($null -ne $_) { Write-Host $_ }
+            }
+        }
+
+        return $result
     }
     finally {
         Pop-Location
@@ -91,7 +146,10 @@ function Invoke-Gh {
 function Test-DubiousOwnershipMessage {
     param([object[]]$Output)
 
-    $text = ($Output | ForEach-Object { $_.ToString() }) -join "`n"
+    $text = ($Output | ForEach-Object {
+        if ($null -ne $_) { $_.ToString() }
+    }) -join "`n"
+
     return (
         $text -match "dubious ownership" -or
         $text -match "safe\.directory" -or
@@ -227,13 +285,15 @@ function Resolve-GitRoot {
         Write-Host "[SKIP] git rev-parse failed: $resolvedPath" -ForegroundColor Yellow
         if ($inside.Output.Count -gt 0) {
             Write-Host "[GIT OUTPUT]"
-            $inside.Output | ForEach-Object { Write-Host $_ }
+            $inside.Output | ForEach-Object {
+                if ($null -ne $_) { Write-Host $_ }
+            }
         }
         return $null
     }
 
     $insideText = ""
-    if ($inside.Output.Count -gt 0) {
+    if ($inside.Output.Count -gt 0 -and $null -ne $inside.Output[0]) {
         $insideText = $inside.Output[0].ToString().Trim().ToLowerInvariant()
     }
 
@@ -244,11 +304,13 @@ function Resolve-GitRoot {
 
     $root = Invoke-Git -Repo $resolvedPath -Args @("rev-parse", "--show-toplevel") -Quiet
 
-    if ($root.Code -ne 0 -or $root.Output.Count -eq 0) {
+    if ($root.Code -ne 0 -or $root.Output.Count -eq 0 -or $null -eq $root.Output[0]) {
         Write-Host "[SKIP] failed to resolve Git root: $resolvedPath" -ForegroundColor Yellow
         if ($root.Output.Count -gt 0) {
             Write-Host "[GIT OUTPUT]"
-            $root.Output | ForEach-Object { Write-Host $_ }
+            $root.Output | ForEach-Object {
+                if ($null -ne $_) { Write-Host $_ }
+            }
         }
         return $null
     }
@@ -260,7 +322,7 @@ function Get-CurrentBranch {
     param([string]$Repo)
 
     $branch = Invoke-Git -Repo $Repo -Args @("branch", "--show-current") -Quiet
-    if ($branch.Code -eq 0 -and $branch.Output.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($branch.Output[0])) {
+    if ($branch.Code -eq 0 -and $branch.Output.Count -gt 0 -and $null -ne $branch.Output[0] -and -not [string]::IsNullOrWhiteSpace($branch.Output[0])) {
         return $branch.Output[0].ToString().Trim()
     }
 
@@ -272,7 +334,10 @@ function Get-Remotes {
 
     $r = Invoke-Git -Repo $Repo -Args @("remote") -Quiet
     if ($r.Code -ne 0) { return @() }
-    return @($r.Output | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ })
+
+    return @($r.Output | Where-Object { $null -ne $_ } | ForEach-Object {
+        $_.ToString().Trim()
+    } | Where-Object { $_ })
 }
 
 function Get-RemoteDefaultBranch {
@@ -284,6 +349,8 @@ function Get-RemoteDefaultBranch {
     $show = Invoke-Git -Repo $Repo -Args @("remote", "show", $Remote) -Quiet
     if ($show.Code -eq 0) {
         foreach ($line in $show.Output) {
+            if ($null -eq $line) { continue }
+
             $s = $line.ToString().Trim()
             if ($s -match "^HEAD branch:\s*(.+)$") {
                 return $Matches[1].Trim()
@@ -312,11 +379,107 @@ function Get-UpstreamTracking {
     param([string]$Repo)
 
     $tracking = Invoke-Git -Repo $Repo -Args @("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") -Quiet
-    if ($tracking.Code -eq 0 -and $tracking.Output.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($tracking.Output[0])) {
+    if ($tracking.Code -eq 0 -and $tracking.Output.Count -gt 0 -and $null -ne $tracking.Output[0] -and -not [string]::IsNullOrWhiteSpace($tracking.Output[0])) {
         return $tracking.Output[0].ToString().Trim()
     }
 
     return $null
+}
+
+function Test-RemoteBranchExists {
+    param(
+        [string]$Repo,
+        [string]$Remote,
+        [string]$Branch
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Remote) -or [string]::IsNullOrWhiteSpace($Branch)) {
+        return $false
+    }
+
+    $check = Invoke-Git -Repo $Repo -Args @("ls-remote", "--exit-code", "--heads", $Remote, $Branch) -Quiet
+    return ($check.Code -eq 0 -and $check.Output.Count -gt 0)
+}
+
+function Select-UpdateSource {
+    param([string]$Repo)
+
+    $branch = Get-CurrentBranch -Repo $Repo
+    $remotes = Get-Remotes -Repo $Repo
+
+    if ($remotes.Count -eq 0) {
+        return $null
+    }
+
+    if ($UpdateRemote -ne "auto") {
+        if (-not ($remotes -contains $UpdateRemote)) {
+            Write-Host "[WARN] requested update remote does not exist: $UpdateRemote" -ForegroundColor Yellow
+            return $null
+        }
+
+        if ($branch -and (Test-RemoteBranchExists -Repo $Repo -Remote $UpdateRemote -Branch $branch)) {
+            return [PSCustomObject]@{
+                Remote = $UpdateRemote
+                Branch = $branch
+                Reason = "requested remote has same branch"
+            }
+        }
+
+        $defaultBranch = Get-RemoteDefaultBranch -Repo $Repo -Remote $UpdateRemote
+        return [PSCustomObject]@{
+            Remote = $UpdateRemote
+            Branch = $defaultBranch
+            Reason = "requested remote default branch"
+        }
+    }
+
+    # fork 구조: upstream이 있으면 우선 upstream 기준으로 업데이트한다.
+    # 단, feature 브랜치에 실수로 upstream/main을 섞는 건 막는다.
+    if ($remotes -contains "upstream") {
+        if ($branch -and (Test-RemoteBranchExists -Repo $Repo -Remote "upstream" -Branch $branch)) {
+            return [PSCustomObject]@{
+                Remote = "upstream"
+                Branch = $branch
+                Reason = "upstream has same branch"
+            }
+        }
+
+        $upstreamDefault = Get-RemoteDefaultBranch -Repo $Repo -Remote "upstream"
+
+        if ($branch -and ($branch -eq $upstreamDefault -or $branch -in @("main", "master", "develop"))) {
+            return [PSCustomObject]@{
+                Remote = "upstream"
+                Branch = $upstreamDefault
+                Reason = "fork default branch sync"
+            }
+        }
+    }
+
+    $tracking = Get-UpstreamTracking -Repo $Repo
+    if ($tracking -and $tracking -match "^([^/]+)/(.+)$") {
+        return [PSCustomObject]@{
+            Remote = $Matches[1]
+            Branch = $Matches[2]
+            Reason = "tracking branch"
+        }
+    }
+
+    if ($branch -and ($remotes -contains "origin") -and (Test-RemoteBranchExists -Repo $Repo -Remote "origin" -Branch $branch)) {
+        return [PSCustomObject]@{
+            Remote = "origin"
+            Branch = $branch
+            Reason = "origin has same branch"
+        }
+    }
+
+    $remote = if ($remotes -contains "origin") { "origin" } else { $remotes[0] }
+    $default = Get-RemoteDefaultBranch -Repo $Repo -Remote $remote
+
+    return [PSCustomObject]@{
+        Remote = $remote
+        Branch = $default
+        Reason = "fallback default branch"
+    }
 }
 
 function Show-LocalChanges {
@@ -327,6 +490,66 @@ function Show-LocalChanges {
     Invoke-Git -Repo $Repo -Args @("status", "--short")
 }
 
+function Get-AutoStashes {
+    param([string]$Repo)
+
+    $list = Invoke-Git -Repo $Repo -Args @("stash", "list", "--format=%gd|%H|%s") -Quiet
+    if ($list.Code -ne 0) { return @() }
+
+    # PowerShell 5.x에서 Generic List를 그대로 return하면 환경에 따라
+    # "인수 형식이 일치하지 않습니다"가 날 수 있어서 순수 PS 배열로 처리한다.
+    $items = @()
+
+    foreach ($line in $list.Output) {
+        if ($null -eq $line) { continue }
+
+        $text = $line.ToString()
+        if ($text -notmatch "^(.+?)\|([0-9a-fA-F]+)\|(.+)$") {
+            continue
+        }
+
+        $ref = $Matches[1]
+        $hash = $Matches[2]
+        $subject = $Matches[3]
+
+        if ($subject -notmatch "auto-update_keep_") {
+            continue
+        }
+
+        $items += [PSCustomObject]@{
+            Ref = $ref
+            Hash = $hash
+            Subject = $subject
+        }
+    }
+
+    return $items
+}
+
+function Find-StashRef {
+    param(
+        [string]$Repo,
+        [string]$Hash,
+        [string]$Message
+    )
+
+    $stashes = Get-AutoStashes -Repo $Repo
+
+    foreach ($stash in $stashes) {
+        if (-not [string]::IsNullOrWhiteSpace($Hash) -and $stash.Hash -eq $Hash) {
+            return $stash.Ref
+        }
+    }
+
+    foreach ($stash in $stashes) {
+        if (-not [string]::IsNullOrWhiteSpace($Message) -and $stash.Subject -match [regex]::Escape($Message)) {
+            return $stash.Ref
+        }
+    }
+
+    return $null
+}
+
 function Make-Stash {
     param([string]$Repo)
 
@@ -335,18 +558,64 @@ function Make-Stash {
 
     Write-Host ""
     Write-Host "[STASH] saving local changes. Message: $msg" -ForegroundColor Yellow
-    $stash = Invoke-Git -Repo $Repo -Args @("stash", "push", "-u", "-m", $msg)
 
-    if ($stash.Code -eq 0) {
-        Write-Host "[OK] stash completed. It will not be popped/dropped automatically." -ForegroundColor Green
-        Write-Host ""
-        Write-Host "[RECENT STASHES]"
-        Invoke-Git -Repo $Repo -Args @("stash", "list", "--max-count=5")
-        return $true
+    $beforeHash = $null
+    $beforeTop = Get-AutoStashes -Repo $Repo | Select-Object -First 1
+    if ($null -ne $beforeTop) {
+        $beforeHash = $beforeTop.Hash
     }
 
-    Write-Host "[ERROR] stash failed. Skipping this repo." -ForegroundColor Red
-    return $false
+    $stash = Invoke-Git -Repo $Repo -Args @("stash", "push", "-u", "-m", $msg)
+
+    if ($stash.Code -ne 0) {
+        Write-Host "[ERROR] stash failed. Skipping this repo." -ForegroundColor Red
+        return [PSCustomObject]@{
+            Success = $false
+            DidStash = $false
+            Ref = $null
+            Hash = $null
+            Message = $msg
+        }
+    }
+
+    $after = Get-AutoStashes -Repo $Repo
+    $created = $null
+
+    foreach ($stashItem in $after) {
+        if ($stashItem.Subject -match [regex]::Escape($msg)) {
+            $created = $stashItem
+            break
+        }
+    }
+
+    if ($null -eq $created) {
+        $top = $after | Select-Object -First 1
+        if ($null -ne $top -and $top.Hash -ne $beforeHash) {
+            $created = $top
+        }
+    }
+
+    if ($null -eq $created) {
+        Write-Host "[ERROR] stash was created, but script could not find its ref. Manual check needed." -ForegroundColor Red
+        Invoke-Git -Repo $Repo -Args @("stash", "list", "--max-count=5")
+        return [PSCustomObject]@{
+            Success = $false
+            DidStash = $true
+            Ref = $null
+            Hash = $null
+            Message = $msg
+        }
+    }
+
+    Write-Host "[OK] stash completed: $($created.Ref)" -ForegroundColor Green
+
+    return [PSCustomObject]@{
+        Success = $true
+        DidStash = $true
+        Ref = $created.Ref
+        Hash = $created.Hash
+        Message = $msg
+    }
 }
 
 function Fetch-All {
@@ -358,54 +627,225 @@ function Fetch-All {
     return ($fetch.Code -eq 0)
 }
 
-function Pull-Repo {
+function Get-GitInternalPath {
+    param(
+        [string]$Repo,
+        [string]$Name
+    )
+
+    $pathResult = Invoke-Git -Repo $Repo -Args @("rev-parse", "--git-path", $Name) -Quiet
+    if ($pathResult.Code -ne 0 -or $pathResult.Output.Count -eq 0 -or $null -eq $pathResult.Output[0]) {
+        return $null
+    }
+
+    $p = $pathResult.Output[0].ToString().Trim()
+    if ([System.IO.Path]::IsPathRooted($p)) { return $p }
+    return (Join-Path $Repo $p)
+}
+
+function Test-GitConflictState {
     param([string]$Repo)
 
-    $tracking = Get-UpstreamTracking -Repo $Repo
+    $paths = @(
+        (Get-GitInternalPath -Repo $Repo -Name "rebase-merge"),
+        (Get-GitInternalPath -Repo $Repo -Name "rebase-apply"),
+        (Get-GitInternalPath -Repo $Repo -Name "MERGE_HEAD")
+    ) | Where-Object { $_ }
 
-    if ($tracking) {
+    foreach ($p in $paths) {
+        if (Test-Path -LiteralPath $p) { return $true }
+    }
+
+    $unmerged = Invoke-Git -Repo $Repo -Args @("diff", "--name-only", "--diff-filter=U") -Quiet
+    return ($unmerged.Code -eq 0 -and $unmerged.Output.Count -gt 0)
+}
+
+function Show-ConflictFiles {
+    param([string]$Repo)
+
+    Write-Host ""
+    Write-Host "[CONFLICT FILES]" -ForegroundColor Red
+    $unmerged = Invoke-Git -Repo $Repo -Args @("diff", "--name-only", "--diff-filter=U") -Quiet
+    if ($unmerged.Code -eq 0 -and $unmerged.Output.Count -gt 0) {
+        $unmerged.Output | Where-Object { $null -ne $_ } | ForEach-Object {
+            Write-Host " - $_" -ForegroundColor Red
+        }
+    }
+    else {
+        Write-Host " - Git conflict state detected, but no unmerged file list was returned." -ForegroundColor Yellow
+    }
+}
+
+function Resolve-ConflictPrompt {
+    param(
+        [string]$Repo,
+        [string]$OperationName
+    )
+
+    Show-ConflictFiles -Repo $Repo
+
+    if ($ContinueOnConflict) {
+        Write-Host "[CONFLICT] $OperationName conflict detected. Leaving this repo as-is and continuing because -ContinueOnConflict is set." -ForegroundColor Red
+        return $false
+    }
+
+    while ($true) {
         Write-Host ""
-        Write-Host "[PULL] tracking branch: $tracking"
-        $pull = Invoke-Git -Repo $Repo -Args @("pull", "--ff-only")
-        if ($pull.Code -eq 0) { return $true }
+        Write-Host "[CONFLICT] $OperationName stopped because of conflicts." -ForegroundColor Red
+        Write-Host "  R : I resolved conflicts manually. Continue operation."
+        Write-Host "  A : Abort current operation and skip this repo."
+        Write-Host "  S : Stop the whole script here."
+        $ans = Read-Host "Choose [R/A/S]"
 
-        Write-Host "[WARN] ff-only pull failed. Rebase may require manual conflict resolution." -ForegroundColor Yellow
-        $ans = Read-Host "Run git pull --rebase? [y/N]"
-        if ($ans -match "^[Yy]") {
-            $rebase = Invoke-Git -Repo $Repo -Args @("pull", "--rebase")
-            return ($rebase.Code -eq 0)
+        if ($ans -match "^[Rr]") {
+            if ($OperationName -match "rebase") {
+                $continueResult = Invoke-Git -Repo $Repo -Args @("rebase", "--continue")
+                if ($continueResult.Code -eq 0) { return $true }
+
+                if (Test-GitConflictState -Repo $Repo) {
+                    Show-ConflictFiles -Repo $Repo
+                    continue
+                }
+
+                Write-Host "[ERROR] rebase --continue failed. Manual check needed." -ForegroundColor Red
+                return $false
+            }
+
+            $continueMerge = Invoke-Git -Repo $Repo -Args @("merge", "--continue")
+            if ($continueMerge.Code -eq 0) { return $true }
+
+            if (Test-GitConflictState -Repo $Repo) {
+                Show-ConflictFiles -Repo $Repo
+                continue
+            }
+
+            Write-Host "[ERROR] merge --continue failed. Manual check needed." -ForegroundColor Red
+            return $false
         }
 
+        if ($ans -match "^[Aa]") {
+            if ($OperationName -match "rebase") {
+                Invoke-Git -Repo $Repo -Args @("rebase", "--abort")
+            }
+            else {
+                Invoke-Git -Repo $Repo -Args @("merge", "--abort")
+            }
+            Write-Host "[SKIP] operation aborted. Skipping this repo." -ForegroundColor Yellow
+            return $false
+        }
+
+        if ($ans -match "^[Ss]") {
+            Write-Host "[STOP] user stopped the script because of conflict." -ForegroundColor Red
+            exit 2
+        }
+    }
+}
+
+function Sync-FetchedRemoteBranch {
+    param(
+        [string]$Repo,
+        [string]$Remote,
+        [string]$Branch,
+        [string]$Reason
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Remote) -or [string]::IsNullOrWhiteSpace($Branch)) {
+        Write-Host "[SKIP] invalid sync source."
+        return $true
+    }
+
+    $target = "$Remote/$Branch"
+
+    $verify = Invoke-Git -Repo $Repo -Args @("rev-parse", "--verify", "--quiet", $target) -Quiet
+    if ($verify.Code -ne 0) {
+        Write-Host "[SKIP] remote branch not found after fetch: $target" -ForegroundColor Yellow
+        return $true
+    }
+
+    Write-Host ""
+    Write-Host "[SYNC] $target ($Reason)"
+
+    $merge = Invoke-Git -Repo $Repo -Args @("merge", "--ff-only", $target)
+
+    if ($merge.Code -eq 0) {
+        return $true
+    }
+
+    if (Test-GitConflictState -Repo $Repo) {
+        return (Resolve-ConflictPrompt -Repo $Repo -OperationName "merge")
+    }
+
+    Write-Host "[INFO] ff-only sync was not possible. Trying automatic rebase onto $target." -ForegroundColor Yellow
+
+    $doRebase = $true
+    if ($AskBeforeRebase) {
+        $ans = Read-Host "Run git rebase $target? [y/N]"
+        $doRebase = ($ans -match "^[Yy]")
+    }
+
+    if (-not $doRebase) {
+        Write-Host "[SKIP] user skipped rebase."
         return $false
+    }
+
+    $rebase = Invoke-Git -Repo $Repo -Args @("rebase", $target)
+    if ($rebase.Code -eq 0) {
+        Write-Host "[REBASE OK] rebased onto $target." -ForegroundColor Green
+        return $true
+    }
+
+    if (Test-GitConflictState -Repo $Repo) {
+        return (Resolve-ConflictPrompt -Repo $Repo -OperationName "rebase")
+    }
+
+    Write-Host "[ERROR] rebase failed, but no conflict state was detected. Manual check needed." -ForegroundColor Red
+    return $false
+}
+
+function Sync-OriginBranch {
+    param(
+        [string]$Repo,
+        [string]$Reason = "origin branch sync"
+    )
+
+    if ($SkipOriginPull) {
+        Write-Host "[ORIGIN SYNC SKIP] -SkipOriginPull is set."
+        return $true
+    }
+
+    $branch = Get-CurrentBranch -Repo $Repo
+    if (-not $branch) {
+        Write-Host "[ORIGIN SYNC SKIP] detached HEAD."
+        return $true
     }
 
     $remotes = Get-Remotes -Repo $Repo
-    if ($remotes.Count -eq 0) {
-        Write-Host "[SKIP] no remotes."
-        return $false
+    if (-not ($remotes -contains "origin")) {
+        Write-Host "[ORIGIN SYNC SKIP] no origin remote."
+        return $true
     }
 
-    $remote = if ($remotes -contains "upstream") { "upstream" } elseif ($remotes -contains "origin") { "origin" } else { $remotes[0] }
-    $branch = Get-RemoteDefaultBranch -Repo $Repo -Remote $remote
+    if (-not (Test-RemoteBranchExists -Repo $Repo -Remote "origin" -Branch $branch)) {
+        Write-Host "[ORIGIN SYNC SKIP] origin/$branch does not exist yet. Push step can create it."
+        return $true
+    }
 
-    if (-not $branch) {
-        Write-Host "[SKIP] failed to find default branch for $remote."
+    return (Sync-FetchedRemoteBranch -Repo $Repo -Remote "origin" -Branch $branch -Reason $Reason)
+}
+
+function Pull-Repo {
+    param([string]$Repo)
+
+    $source = Select-UpdateSource -Repo $Repo
+    if ($null -eq $source) {
+        Write-Host "[SKIP] no update source."
         return $false
     }
 
     Write-Host ""
-    Write-Host "[PULL] no tracking branch. Trying $remote/$branch with --ff-only"
-    $pull2 = Invoke-Git -Repo $Repo -Args @("pull", "--ff-only", $remote, $branch)
-    if ($pull2.Code -eq 0) { return $true }
+    Write-Host "[UPDATE SOURCE] $($source.Remote)/$($source.Branch) ($($source.Reason))"
 
-    Write-Host "[WARN] ff-only pull failed. Rebase may require manual conflict resolution." -ForegroundColor Yellow
-    $ans2 = Read-Host "Run git pull --rebase $remote $branch? [y/N]"
-    if ($ans2 -match "^[Yy]") {
-        $rebase2 = Invoke-Git -Repo $Repo -Args @("pull", "--rebase", $remote, $branch)
-        return ($rebase2.Code -eq 0)
-    }
-
-    return $false
+    return (Sync-FetchedRemoteBranch -Repo $Repo -Remote $source.Remote -Branch $source.Branch -Reason $source.Reason)
 }
 
 function Push-IfAhead {
@@ -423,18 +863,36 @@ function Push-IfAhead {
         return
     }
 
-    $remoteBranchCheck = Invoke-Git -Repo $Repo -Args @("rev-parse", "--verify", "--quiet", "origin/$branch") -Quiet
+    $remoteRef = "origin/$branch"
+
+    $remoteBranchCheck = Invoke-Git -Repo $Repo -Args @("rev-parse", "--verify", "--quiet", $remoteRef) -Quiet
     if ($remoteBranchCheck.Code -ne 0) {
-        Write-Host "[INFO] origin/$branch does not exist yet."
-        $ansNew = Read-Host "Push current branch to origin? [y/N]"
-        if ($ansNew -match "^[Yy]") {
-            Invoke-Git -Repo $Repo -Args @("push", "-u", "origin", $branch)
+        Write-Host "[PUSH NEW] $remoteRef does not exist yet."
+
+        $doPushNew = $true
+        if ($AskBeforePushOrigin) {
+            $ansNew = Read-Host "Push current branch to origin and set upstream? [y/N]"
+            $doPushNew = ($ansNew -match "^[Yy]")
         }
+
+        if ($doPushNew) {
+            $pushNew = Invoke-Git -Repo $Repo -Args @("push", "-u", "origin", $branch)
+            if ($pushNew.Code -eq 0) {
+                Write-Host "[PUSH OK] origin/$branch created." -ForegroundColor Green
+            }
+            else {
+                Write-Host "[PUSH FAIL] failed to create origin/$branch." -ForegroundColor Red
+            }
+        }
+        else {
+            Write-Host "[PUSH SKIP] user skipped new branch push."
+        }
+
         return
     }
 
-    $count = Invoke-Git -Repo $Repo -Args @("rev-list", "--left-right", "--count", "origin/$branch...HEAD") -Quiet
-    if ($count.Code -ne 0 -or $count.Output.Count -eq 0) {
+    $count = Invoke-Git -Repo $Repo -Args @("rev-list", "--left-right", "--count", "$remoteRef...HEAD") -Quiet
+    if ($count.Code -ne 0 -or $count.Output.Count -eq 0 -or $null -eq $count.Output[0]) {
         Write-Host "[WARN] failed to check push difference."
         return
     }
@@ -446,15 +904,159 @@ function Push-IfAhead {
     $ahead = [int]$parts[1]
 
     if ($ahead -le 0) {
-        Write-Host "[PUSH SKIP] no commits to push to origin/$branch."
+        Write-Host "[PUSH SKIP] no commits to push to $remoteRef."
         return
     }
 
-    Write-Host "[PUSH CHECK] ahead=$ahead, behind=$behind for origin/$branch"
-    $ans = Read-Host "Push to origin/$branch? [y/N]"
-    if ($ans -match "^[Yy]") {
-        Invoke-Git -Repo $Repo -Args @("push", "origin", $branch)
+    if ($behind -gt 0) {
+        Write-Host "[PUSH BLOCKED] local is ahead=$ahead but also behind=$behind from $remoteRef." -ForegroundColor Yellow
+        Write-Host "               Manual check needed to avoid overwriting/divergent push."
+        return
     }
+
+    Write-Host "[PUSH CHECK] ahead=$ahead, behind=$behind for $remoteRef"
+
+    $doPush = $true
+    if ($AskBeforePushOrigin) {
+        $ans = Read-Host "Push to $remoteRef? [y/N]"
+        $doPush = ($ans -match "^[Yy]")
+    }
+
+    if ($doPush) {
+        $push = Invoke-Git -Repo $Repo -Args @("push", "origin", $branch)
+        if ($push.Code -eq 0) {
+            Write-Host "[PUSH OK] pushed to $remoteRef." -ForegroundColor Green
+        }
+        else {
+            Write-Host "[PUSH FAIL] push to $remoteRef failed." -ForegroundColor Red
+        }
+    }
+    else {
+        Write-Host "[PUSH SKIP] user skipped push."
+    }
+}
+
+function Restore-Stash {
+    param(
+        [string]$Repo,
+        [object]$StashInfo
+    )
+
+    if ($null -eq $StashInfo -or -not $StashInfo.DidStash) {
+        return $true
+    }
+
+    if (Test-GitConflictState -Repo $Repo) {
+        Write-Host "[STASH RESTORE SKIP] repo is in conflict state. Stash kept." -ForegroundColor Red
+        if ($StashInfo.Ref) { Write-Host "[STASH KEPT] $($StashInfo.Ref)" -ForegroundColor Yellow }
+        return $false
+    }
+
+    $stashRef = Find-StashRef -Repo $Repo -Hash $StashInfo.Hash -Message $StashInfo.Message
+    if ([string]::IsNullOrWhiteSpace($stashRef)) {
+        $stashRef = $StashInfo.Ref
+    }
+
+    if ([string]::IsNullOrWhiteSpace($stashRef)) {
+        Write-Host "[STASH RESTORE FAIL] stash ref not found. Manual check: git stash list" -ForegroundColor Red
+        return $false
+    }
+
+    Write-Host ""
+    Write-Host "[STASH RESTORE] applying $stashRef" -ForegroundColor Yellow
+
+    $apply = Invoke-Git -Repo $Repo -Args @("stash", "apply", "--index", $stashRef)
+
+    if ($apply.Code -ne 0) {
+        Write-Host "[STASH RESTORE FAIL] stash apply failed. Stash was kept: $stashRef" -ForegroundColor Red
+
+        if (Test-GitConflictState -Repo $Repo) {
+            Show-ConflictFiles -Repo $Repo
+            Write-Host ""
+            Write-Host "[IMPORTANT] Resolve conflicts manually. Do NOT drop this stash until confirmed." -ForegroundColor Red
+        }
+
+        return $false
+    }
+
+    Write-Host "[STASH RESTORE OK] local changes restored." -ForegroundColor Green
+
+    if ($KeepStashAfterRestore) {
+        Write-Host "[STASH KEEP] -KeepStashAfterRestore is set. Stash kept: $stashRef" -ForegroundColor Yellow
+        return $true
+    }
+
+    $drop = Invoke-Git -Repo $Repo -Args @("stash", "drop", $stashRef)
+
+    if ($drop.Code -ne 0) {
+        Write-Host "[WARN] restored, but failed to drop stash. You may drop it manually later: $stashRef" -ForegroundColor Yellow
+        return $true
+    }
+
+    Write-Host "[STASH DROP OK] restored stash removed: $stashRef" -ForegroundColor Green
+    return $true
+}
+
+function Try-RestoreBeforeLeavingRepo {
+    param(
+        [string]$Repo,
+        [object]$StashInfo
+    )
+
+    if ($null -eq $StashInfo -or -not $StashInfo.DidStash) {
+        return $true
+    }
+
+    Write-Host ""
+    Write-Host "[RESTORE BEFORE LEAVING] this repo had auto-stashed local changes." -ForegroundColor Yellow
+
+    $restored = Restore-Stash -Repo $Repo -StashInfo $StashInfo
+    if (-not $restored) {
+        Write-Host "[WARN] Could not restore stash automatically. Stash is kept." -ForegroundColor Yellow
+        if ($StashInfo.Ref) { Write-Host "[WARN] Stash ref originally captured: $($StashInfo.Ref)" -ForegroundColor Yellow }
+    }
+
+    return $restored
+}
+
+function Restore-LatestAutoStashForRepo {
+    param([string]$Repo)
+
+    Write-Section "RESTORE AUTO STASH: $Repo"
+
+    $root = Resolve-GitRoot -Path $Repo
+    if (-not $root) {
+        return
+    }
+
+    if (Test-GitConflictState -Repo $root) {
+        Write-Host "[SKIP] repo is in conflict state. Resolve conflict first." -ForegroundColor Red
+        Show-ConflictFiles -Repo $root
+        return
+    }
+
+    $stashes = Get-AutoStashes -Repo $root
+    if ($stashes.Count -eq 0) {
+        Write-Host "[SKIP] no auto-update_keep_* stash found."
+        return
+    }
+
+    Write-Host "[AUTO STASHES]"
+    $stashes | Select-Object -First 5 | ForEach-Object {
+        Write-Host " - $($_.Ref) $($_.Subject)"
+    }
+
+    $latest = $stashes | Select-Object -First 1
+
+    $info = [PSCustomObject]@{
+        Success = $true
+        DidStash = $true
+        Ref = $latest.Ref
+        Hash = $latest.Hash
+        Message = $latest.Subject
+    }
+
+    Restore-Stash -Repo $root -StashInfo $info | Out-Null
 }
 
 if (-not (Test-GitInstalled)) {
@@ -464,6 +1066,23 @@ if (-not (Test-GitInstalled)) {
 
 $candidates = Get-RepoCandidates -Root $RootPath -MaxDepth $MaxDepth
 $seen = @{}
+
+if ($RestoreLatestAutoStashOnly) {
+    foreach ($candidate in $candidates) {
+        $root = Resolve-GitRoot -Path $candidate
+        if (-not $root) { continue }
+
+        $key = $root.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+
+        Restore-LatestAutoStashForRepo -Repo $root
+    }
+
+    Write-Host ""
+    Write-Host "Auto stash restore jobs completed."
+    exit 0
+}
 
 foreach ($candidate in $candidates) {
     Write-Section "AUTO UPDATE: $candidate"
@@ -485,19 +1104,35 @@ foreach ($candidate in $candidates) {
     $branch = Get-CurrentBranch -Repo $root
     if ($branch) { Write-Host "[BRANCH] $branch" } else { Write-Host "[BRANCH] detached HEAD" -ForegroundColor Yellow }
 
+    $stashInfo = [PSCustomObject]@{
+        Success = $true
+        DidStash = $false
+        Ref = $null
+        Hash = $null
+        Message = $null
+    }
+
     if (Has-LocalChanges -Repo $root) {
         Show-LocalChanges -Repo $root
         Write-Host ""
-        Write-Host "Local changes found before update." -ForegroundColor Yellow
-        Write-Host "Stash will be kept and not popped/dropped automatically."
-        $ans = Read-Host "Save as stash and continue update? [y/N]"
-        if ($ans -notmatch "^[Yy]") {
-            Write-Host "[SKIP] user did not choose stash."
+        Write-Host "[LOCAL] local changes found. Auto-stashing before update." -ForegroundColor Yellow
+        Write-Host "[LOCAL] stash will be restored after update + push."
+
+        $doStash = $true
+        if ($AskBeforeStash) {
+            $ans = Read-Host "Save as stash and continue update? [y/N]"
+            $doStash = ($ans -match "^[Yy]")
+        }
+
+        if (-not $doStash) {
+            Write-Host "[SKIP] user skipped stash."
             continue
         }
 
-        $ok = Make-Stash -Repo $root
-        if (-not $ok) { continue }
+        $stashInfo = Make-Stash -Repo $root
+        if (-not $stashInfo.Success) {
+            continue
+        }
     }
     else {
         Write-Host "[CLEAN] no local changes."
@@ -506,16 +1141,42 @@ foreach ($candidate in $candidates) {
     $fetched = Fetch-All -Repo $root
     if (-not $fetched) {
         Write-Host "[WARN] fetch failed. Skipping pull." -ForegroundColor Yellow
+        Try-RestoreBeforeLeavingRepo -Repo $root -StashInfo $stashInfo | Out-Null
+        continue
+    }
+
+    $originBefore = Sync-OriginBranch -Repo $root -Reason "origin sync before upstream/update source"
+    if (-not $originBefore) {
+        Write-Host "[WARN] origin sync failed or stopped. Manual check needed." -ForegroundColor Yellow
+        Try-RestoreBeforeLeavingRepo -Repo $root -StashInfo $stashInfo | Out-Null
         continue
     }
 
     $pulled = Pull-Repo -Repo $root
     if (-not $pulled) {
-        Write-Host "[WARN] pull failed or cancelled. Manual check needed." -ForegroundColor Yellow
+        Write-Host "[WARN] update source sync failed or cancelled. Manual check needed." -ForegroundColor Yellow
+        Try-RestoreBeforeLeavingRepo -Repo $root -StashInfo $stashInfo | Out-Null
+        continue
+    }
+
+    $originAfter = Sync-OriginBranch -Repo $root -Reason "origin sync before push"
+    if (-not $originAfter) {
+        Write-Host "[WARN] final origin sync failed or stopped. Manual check needed." -ForegroundColor Yellow
+        Try-RestoreBeforeLeavingRepo -Repo $root -StashInfo $stashInfo | Out-Null
         continue
     }
 
     Push-IfAhead -Repo $root
+
+    if ($stashInfo.DidStash) {
+        $restored = Restore-Stash -Repo $root -StashInfo $stashInfo
+
+        if (-not $restored) {
+            Write-Host "[WARN] update/push finished, but stash restore needs manual fix." -ForegroundColor Yellow
+            if ($stashInfo.Ref) { Write-Host "[WARN] kept stash originally captured: $($stashInfo.Ref)" -ForegroundColor Yellow }
+            continue
+        }
+    }
 
     Write-Host ""
     Write-Host "[DONE] $root" -ForegroundColor Green
